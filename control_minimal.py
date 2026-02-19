@@ -9,8 +9,8 @@ CH = 2
 TX_HZ = 100
 DT = 1.0 / TX_HZ
 
-CLAMP_TIME_S = 2.1  # Assumption
-RELEASE_TIME_S = 2.1 # Assumption
+CLAMP_TIME_S = 2.5  # Assumption
+RELEASE_TIME_S = 2.5 # Assumption
 
 TRANS_SPEED = 30
 TRANS_TIME_S = 2.0
@@ -43,36 +43,35 @@ def main():
             send(clamp, trans, rot)
             time.sleep(DT)
 
-    def stop(duration_s: float = 0.3):
+    def stop(duration_s: float = 0.1):
         stream(duration_s, clamp=0, trans=0, rot=0)
 
     print("Selecting channel (settle)...")
-    stop(0.3)
+    stop()
 
     print(f"CLAMP for {CLAMP_TIME_S:.1f}s ...")
     stream(CLAMP_TIME_S, clamp=2, trans=0, rot=0)
-    stop(0.5)
+    stop()
 
     print(f"FORWARD translate {TRANS_TIME_S:.1f}s at speed {TRANS_SPEED} ...")
     stream(TRANS_TIME_S, clamp=0, trans=trans_cmd("forward", TRANS_SPEED), rot=0)
-    stop(0.3)
+    stop()
 
     print(f"BACKWARD translate {TRANS_TIME_S:.1f}s at speed {TRANS_SPEED} ...")
     stream(TRANS_TIME_S, clamp=0, trans=trans_cmd("backward", TRANS_SPEED), rot=0)
-    stop(0.3)
-
+    stop()
 
     print(f"ROTATE CW {ROT_TIME_S:.1f}s at ~{ROT_DEG_S} deg/s ...")
     stream(ROT_TIME_S, clamp=0, trans=0, rot=rot_cmd("cw", ROT_DEG_S))
-    stop(0.3)
+    stop()
 
     print(f"ROTATE CCW {ROT_TIME_S:.1f}s at ~{ROT_DEG_S} deg/s ...")
     stream(ROT_TIME_S, clamp=0, trans=0, rot=rot_cmd("ccw", ROT_DEG_S))
-    stop(0.3)
+    stop()
 
     print(f"RELEASE for {RELEASE_TIME_S:.1f}s ...")
     stream(RELEASE_TIME_S, clamp=1, trans=0, rot=0)
-    stop(0.5)
+    stop()
 
     sock.close()
     print("Done.")
