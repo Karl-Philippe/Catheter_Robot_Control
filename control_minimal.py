@@ -17,7 +17,6 @@ TRANS_TIME_S = 2.0
 
 ROT_DEG_S = 90
 ROT_TIME_S = 2.0
-DO_ROTATE = True
 
 def trans_cmd(direction: str, speed: int) -> int:
     speed = max(1, min(15, int(speed)))
