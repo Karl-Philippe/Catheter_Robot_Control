@@ -40,7 +40,7 @@ TARGET_ANGLE_DEG = 180.0
 # Requested rates (deg/s). These will quantize to steps of ~10 deg/s by encoding.
 RATES_DEG_S = [30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360]
 
-RESULTS_CSV = Path("rotation_180deg_accuracy_vs_rate_with_kr.csv")
+RESULTS_CSV = Path("test\rotation_accuracy_tables.csv")
 
 # ---------------------------------------------------------------------
 # k_r calibration tables (indexed by encoded r = round(rate/10), 1..36)
