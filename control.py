@@ -1,267 +1,210 @@
 import socket
 import time
 from dataclasses import dataclass
-from threading import Thread, Lock
-from typing import Optional, Tuple
 
-# ----------------------------
-# Data models
-# ----------------------------
+# =========================
+# NETWORK / ROBOT SETTINGS
+# =========================
+ROBOT_IP = "192.0.0.12"
+ROBOT_PORT = 2020
+LOCAL_BIND_PORT = 54111
+
+CH = 2
+TX_HZ = 100
+DT = 1.0 / TX_HZ
+
+# =========================
+# CALIBRATION (from your tests)
+# =========================
+TRANS_SPEED_MAX = 50          # allowed by your tests: 0..50 mm/s
+K_ROT = 1.5                   # according to tested global rotation
+DEFAULT_TRANS_SPEED = 25      # mm/s
+DEFAULT_ROT_SPEED = 90        # deg/s
+
+# Clamp/release timing (open-loop assumptions)
+CLAMP_TIME_S = 2.5
+RELEASE_TIME_S = 2.5
+SETTLE_S = 0.2
+
+# =========================
+# COMMAND ENCODING
+# =========================
+def encode_translation(direction: str, speed_mm_s: float) -> int:
+    """
+    Protocol encoding:
+      forward  => 100 + speed
+      backward => 200 + speed
+    speed is integer magnitude.
+    """
+    speed = float(speed_mm_s)
+    if speed <= 0:
+        return 0
+    mag = int(round(speed))
+    mag = max(1, min(TRANS_SPEED_MAX, mag))
+    base = 100 if direction == "forward" else 200
+    return base + mag
+
+
+def encode_rotation(direction: str, rate_deg_s: float) -> tuple[int, float, int]:
+    """
+    Protocol encoding:
+      cw  => 100 + r
+      ccw => 200 + r
+    where r = round(rate/10), clamped to 1..36
+
+    Returns: (rot_cmd, omega_eff_deg_s, r)
+    """
+    rate = float(rate_deg_s)
+    if rate <= 0:
+        return 0, 0.0, 0
+    r = int(round(rate / 10.0))
+    r = max(1, min(36, r))
+    base = 100 if direction == "cw" else 200
+    cmd = base + r
+    omega_eff = 10.0 * r
+    return cmd, omega_eff, r
+
+
 @dataclass
-class Telemetry:
-    resp_no: int
-    channel: int
-    clamp_status: int
-    displacement_mm: float
-    limit_reached: int
-    addr: Tuple[str, int]
-
-    @property
-    def is_clamped(self) -> bool:
-        return self.clamp_status == 10
-
-    @property
-    def is_released(self) -> bool:
-        return self.clamp_status == 1000
+class Params:
+    tx_hz: int = TX_HZ
+    clamp_time_s: float = CLAMP_TIME_S
+    release_time_s: float = RELEASE_TIME_S
+    settle_s: float = SETTLE_S
+    k_rot: float = K_ROT
+    default_trans_speed: float = DEFAULT_TRANS_SPEED
+    default_rot_speed: float = DEFAULT_ROT_SPEED
 
 
-# ----------------------------
-# Controller
-# ----------------------------
-class AviarUDPController:
+class AVIARRobot:
     """
-    Control the robot via UDP protocol:
-      msgNo/channel/clamp/translation/rotation
-
-    Network from your screenshot:
-      - Send commands to robot SW: 192.0.0.12:2020
-      - Receive telemetry on PC:   192.0.0.20:54111
+    Control API:
+      - translate_by(distance_mm, speed_mm_s=None)  # signed distance, unsigned speed
+      - rotate_by(angle_deg, rate_deg_s=None)       # signed angle, unsigned speed
     """
 
-    def __init__(self,
-                 robot_ip="192.0.0.12",
-                 robot_port=2020,
-                 pc_ip="192.0.0.20",
-                 pc_port=54111,
-                 tx_rate_hz=100):
-        self.robot_ip = robot_ip
-        self.robot_port = robot_port
-        self.pc_ip = pc_ip
-        self.pc_port = pc_port
-        self.tx_period = 1.0 / float(tx_rate_hz)
-
+    def __init__(self, params: Params = Params()):
+        self.p = params
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.pc_ip, self.pc_port))     # ensures source port == 54111
-        self.sock.settimeout(0.02)
+        self.sock.bind(("", LOCAL_BIND_PORT))
+        self.msg = 1000
+        self.dt = 1.0 / float(self.p.tx_hz)
 
-        self._msg_no = 1000
-        self._lock = Lock()
-        self._last_tel: Optional[Telemetry] = None
+    def _send_frame(self, clamp: int, trans: int, rot: int):
+        self.msg += 1
+        payload = f"{self.msg}/{CH}/{clamp}/{trans}/{rot}".encode("ascii")
+        self.sock.sendto(payload, (ROBOT_IP, ROBOT_PORT))
 
-        self._rx_thread = Thread(target=self._rx_loop, daemon=True)
-        self._running = True
-        self._rx_thread.start()
-
-    # --- Low-level protocol helpers ---
-    def _encode(self, msg_no, ch, clamp, trans, rot) -> bytes:
-        return f"{msg_no}/{ch}/{clamp}/{trans}/{rot}".encode("ascii")
-
-    def _parse_tel(self, data: bytes, addr) -> Optional[Telemetry]:
-        try:
-            parts = data.decode("ascii", errors="ignore").strip().split("/")
-            if len(parts) < 5:
-                return None
-            return Telemetry(
-                resp_no=int(parts[0]),
-                channel=int(parts[1]),
-                clamp_status=int(parts[2]),
-                displacement_mm=float(parts[3]),
-                limit_reached=int(parts[4]),
-                addr=addr,
-            )
-        except Exception:
-            return None
-
-    def _rx_loop(self):
-        while self._running:
-            try:
-                data, addr = self.sock.recvfrom(2048)
-            except socket.timeout:
-                continue
-            tel = self._parse_tel(data, addr)
-            if tel:
-                with self._lock:
-                    self._last_tel = tel
-
-    def last_telemetry(self) -> Optional[Telemetry]:
-        with self._lock:
-            return self._last_tel
-
-    def _send_raw(self, ch: int, clamp: int, trans: int, rot: int) -> int:
-        self._msg_no += 1
-        payload = self._encode(self._msg_no, ch, clamp, trans, rot)
-        self.sock.sendto(payload, (self.robot_ip, self.robot_port))
-        return self._msg_no
-
-    # --- Command encoding ---
-    @staticmethod
-    def translation_cmd(direction: str, speed_mm_s: int) -> int:
-        """
-        direction: 'forward' or 'backward'
-        speed_mm_s: 1..15
-        returns: 100+speed (forward) or 200+speed (backward), or 0 for none
-        """
-        if speed_mm_s <= 0:
-            return 0
-        speed = max(1, min(15, int(speed_mm_s)))
-        if direction == "forward":
-            return 100 + speed
-        elif direction == "backward":
-            return 200 + speed
-        else:
-            raise ValueError("direction must be 'forward' or 'backward'")
-
-    @staticmethod
-    def rotation_cmd(direction: str, speed_deg_s: float) -> int:
-        """
-        direction: 'cw' or 'ccw'
-        speed_deg_s up to ~360.
-        Protocol uses integer ~36 representing speed/10.
-        Example: 109 -> cw at 90 deg/s => 9 * 10
-        """
-        if speed_deg_s <= 0:
-            return 0
-        r = int(round(speed_deg_s / 10.0))
-        r = max(1, min(36, r))
-        if direction == "cw":
-            return 100 + r
-        elif direction == "ccw":
-            return 200 + r
-        else:
-            raise ValueError("direction must be 'cw' or 'ccw'")
-
-    # --- High-level actions (explicit) ---
-    def stop(self, ch: int):
-        """Stop translation + rotation on channel ch."""
-        self._send_raw(ch, clamp=0, trans=0, rot=0)
-
-    def clamp(self, ch: int, timeout_s=2.0) -> bool:
-        """Command clamp and wait until telemetry reports clamped (status=10)."""
-        self._send_raw(ch, clamp=2, trans=0, rot=0)
-        t0 = time.time()
-        while time.time() - t0 < timeout_s:
-            tel = self.last_telemetry()
-            if tel and tel.channel == ch and tel.is_clamped:
-                return True
-            time.sleep(0.01)
-        return False
-
-    def release(self, ch: int, timeout_s=2.0) -> bool:
-        """Command release and wait until telemetry reports released (status=1000)."""
-        self._send_raw(ch, clamp=1, trans=0, rot=0)
-        t0 = time.time()
-        while time.time() - t0 < timeout_s:
-            tel = self.last_telemetry()
-            if tel and tel.channel == ch and tel.is_released:
-                return True
-            time.sleep(0.01)
-        return False
-
-    def translate_mm(self, ch: int, delta_mm: float, speed_mm_s: int, timeout_s=10.0) -> bool:
-        """
-        Move by a desired length in mm, using displacement telemetry as feedback.
-        delta_mm > 0 => forward, < 0 => backward
-        """
-        tel = self.last_telemetry()
-        if not tel:
-            raise RuntimeError("No telemetry received. Click Start in robot SW and check networking.")
-
-        start = tel.displacement_mm
-        target = start + float(delta_mm)
-
-        direction = "forward" if delta_mm >= 0 else "backward"
-        trans = self.translation_cmd(direction, speed_mm_s)
-
-        t0 = time.time()
-        while time.time() - t0 < timeout_s:
-            tel = self.last_telemetry()
-            if not tel:
-                continue
-            if tel.limit_reached == 1:
-                self.stop(ch)
-                return False
-
-            # Decide if we reached target (crossing logic)
-            d = tel.displacement_mm
-            if delta_mm >= 0 and d >= target:
-                self.stop(ch)
-                return True
-            if delta_mm < 0 and d <= target:
-                self.stop(ch)
-                return True
-
-            # keep streaming motion command
-            self._send_raw(ch, clamp=0, trans=trans, rot=0)
-            time.sleep(self.tx_period)
-
-        self.stop(ch)
-        return False
-
-    def rotate_deg(self, ch: int, delta_deg: float, speed_deg_s: float, timeout_s=10.0) -> bool:
-        """
-        Best-effort rotation-by-angle using time only.
-        WARNING: No telemetry feedback for rotation angle in your protocol.
-        """
-        if speed_deg_s <= 0:
-            raise ValueError("speed_deg_s must be > 0")
-
-        direction = "cw" if delta_deg >= 0 else "ccw"
-        rot = self.rotation_cmd(direction, abs(speed_deg_s))
-
-        duration = abs(delta_deg) / float(speed_deg_s)
-        duration = min(duration, timeout_s)
-
-        t_end = time.time() + duration
+    def _stream(self, duration_s: float, clamp: int, trans: int, rot: int):
+        t_end = time.time() + float(duration_s)
         while time.time() < t_end:
-            self._send_raw(ch, clamp=0, trans=0, rot=rot)
-            time.sleep(self.tx_period)
+            self._send_frame(clamp=clamp, trans=trans, rot=rot)
+            time.sleep(self.dt)
 
-        self.stop(ch)
-        return True
+    def stop(self, duration_s: float = 0.1):
+        self._stream(duration_s, clamp=0, trans=0, rot=0)
+
+    def clamp(self):
+        self._stream(self.p.clamp_time_s, clamp=2, trans=0, rot=0)
+        self.stop(self.p.settle_s)
+
+    def release(self):
+        self._stream(self.p.release_time_s, clamp=1, trans=0, rot=0)
+        self.stop(self.p.settle_s)
+
+    # -------------------------
+    # Signed distance, unsigned speed
+    # -------------------------
+    def translate_by(self, distance_mm: float, speed_mm_s: float | None = None):
+        """
+        distance_mm: signed (positive=forward, negative=backward)
+        speed_mm_s: unsigned magnitude (mm/s). If None, uses default_trans_speed.
+
+        Open-loop duration: t = |distance| / speed
+        """
+        d = float(distance_mm)
+        if abs(d) < 1e-9:
+            return
+
+        speed = self.p.default_trans_speed if speed_mm_s is None else float(speed_mm_s)
+        if speed <= 0:
+            raise ValueError("speed_mm_s must be > 0 (unsigned).")
+
+        speed = max(1.0, min(float(TRANS_SPEED_MAX), speed))
+        direction = "forward" if d > 0 else "backward"
+        duration_s = abs(d) / speed
+
+        cmd = encode_translation(direction, speed)
+
+        print(f"[TRANS] {d:+.1f} mm @ {speed:.1f} mm/s -> dir={direction}, cmd={cmd}, t={duration_s:.3f}s")
+        self._stream(duration_s, clamp=0, trans=cmd, rot=0)
+        self.stop(self.p.settle_s)
+
+    def rotate_by(self, angle_deg: float, rate_deg_s: float | None = None):
+        """
+        angle_deg: signed (positive=CW, negative=CCW)
+        rate_deg_s: unsigned magnitude (deg/s). If None, uses default_rot_speed.
+
+        Protocol rate is quantized in steps of ~10 deg/s.
+        Uses your calibration:
+            theta_actual ≈ k_rot * (omega_eff * t)
+            => t = |theta_target| / (k_rot * omega_eff)
+        """
+        a = float(angle_deg)
+        if abs(a) < 1e-9:
+            return
+
+        rate = self.p.default_rot_speed if rate_deg_s is None else float(rate_deg_s)
+        if rate <= 0:
+            raise ValueError("rate_deg_s must be > 0 (unsigned).")
+
+        direction = "cw" if a > 0 else "ccw"
+        rot_cmd, omega_eff, r = encode_rotation(direction, rate)
+        if rot_cmd == 0:
+            return
+
+        duration_s = abs(a) / (self.p.k_rot * omega_eff)
+
+        print(f"[ROT] {a:+.1f} deg @ {rate:.1f} deg/s -> dir={direction}, "
+              f"cmd={rot_cmd} (r={r}, omega_eff={omega_eff:.0f}), k_rot={self.p.k_rot:.3f}, t={duration_s:.3f}s")
+        self._stream(duration_s, clamp=0, trans=0, rot=rot_cmd)
+        self.stop(self.p.settle_s)
 
     def close(self):
-        self._running = False
-        time.sleep(0.05)
-        self.sock.close()
+        try:
+            self.stop(0.2)
+        finally:
+            self.sock.close()
 
 
-# ----------------------------
-# Example usage
-# ----------------------------
+# =========================
+# EXAMPLE
+# =========================
+def main():
+    robot = AVIARRobot()
+
+    try:
+        print("Selecting channel (settle)...")
+        robot.stop(0.2)
+
+        print("Clamping...")
+        robot.clamp()
+
+        # Signed distance, unsigned speed (defaults to 25 mm/s)
+        robot.translate_by(+40)           # 40 mm forward @ 25 mm/s
+        robot.translate_by(-40, 35)       # 40 mm backward @ 35 mm/s
+
+        # Signed angle, unsigned speed (defaults to 90 deg/s), with k_rot compensation
+        robot.rotate_by(+180)             # 180 deg CW @ 90 deg/s (quantized), k_rot=1.5
+        robot.rotate_by(-180, 360)        # 180 deg CCW @ 360 deg/s
+
+        print("Releasing...")
+        robot.release()
+
+        print("Done.")
+    finally:
+        robot.close()
+
+
 if __name__ == "__main__":
-    robot = AviarUDPController(
-        robot_ip="192.0.0.12", robot_port=2020,
-        pc_ip="192.0.0.20", pc_port=54111,
-        tx_rate_hz=100
-    )
-
-    CH = 2
-
-    # Wait a moment for telemetry
-    time.sleep(0.2)
-    print("Last telemetry:", robot.last_telemetry())
-
-    # Explicit, control-like commands:
-    ok = robot.clamp(CH)
-    print("clamp:", ok)
-
-    ok = robot.translate_mm(CH, delta_mm=25.0, speed_mm_s=10)   # move 25 mm forward at 10 mm/s
-    print("translate 25mm:", ok)
-
-    ok = robot.rotate_deg(CH, delta_deg=45.0, speed_deg_s=90.0) # approx: 45 degrees at 90 deg/s
-    print("rotate 45deg (timed):", ok)
-
-    ok = robot.release(CH)
-    print("release:", ok)
-
-    robot.close()
+    main()
