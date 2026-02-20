@@ -2,10 +2,10 @@
 Channel-2 translation sweep test
 - Runs translation at speeds: 10,15,20,25,30,35,40,45,50 (mm/s) for 3 seconds each
 - Forward then backward for each speed (so you can see asymmetry / backlash)
-- Writes a results CSV with placeholders for measured displacement
+- Writes a results CSV with placeholders for measured displacement + theoretical displacement
 
 IMPORTANT:
-Your protocol document says translation speed is 1..15 mm/s. You explicitly asked for up to 50.
+Your protocol document says translation speed is 1..15 mm/s. You explicitly asked for up to 50+.
 This script will still send those values (no clamping), but be aware the robot may ignore/saturate them.
 """
 
@@ -28,7 +28,7 @@ SETTLE_S = 0.2
 INTER_TEST_PAUSE_S = 1.0
 
 DURATION_S = 3.0
-SPEEDS_MM_S = [10, 15, 20, 25, 30, 35, 40, 45, 50]
+SPEEDS_MM_S = [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75]
 
 RESULTS_CSV = Path("translation_speed_sweep_results.csv")
 
@@ -43,6 +43,17 @@ def encode_translation(direction: str, speed_mm_s: float) -> int:
     s = int(speed_mm_s)
     base = 100 if direction == "forward" else 200
     return base + s
+
+
+def theoretical_displacement_mm(direction: str, speed_mm_s: float, duration_s: float) -> tuple[float, float]:
+    """
+    Returns:
+      abs_mm: |speed| * duration
+      signed_mm: +abs_mm for forward, -abs_mm for backward
+    """
+    abs_mm = float(speed_mm_s) * float(duration_s)
+    signed_mm = abs_mm if direction == "forward" else -abs_mm
+    return abs_mm, signed_mm
 
 
 class AVIARRobot:
@@ -98,6 +109,8 @@ def ensure_results_header(path: Path):
             "speed_mm_s",
             "duration_s",
             "translation_cmd",
+            "theoretical_displacement_mm",
+            "signed_theoretical_displacement_mm",
             "measured_actual_displacement_mm",
             "measurement_notes",
         ])
@@ -116,12 +129,16 @@ def main():
         print(f"=== Channel {CHANNEL} translation sweep ===")
         print(f"Speeds: {SPEEDS_MM_S} mm/s, duration: {DURATION_S}s each")
         print("Will do FORWARD then BACKWARD for each speed.\n")
+
         print("Clamping...")
         robot.clamp()
 
         for s in SPEEDS_MM_S:
             for direction in ("forward", "backward"):
-                print(f"\nTranslate {direction.upper()} at {s} mm/s for {DURATION_S:.1f}s")
+                abs_mm, signed_mm = theoretical_displacement_mm(direction, s, DURATION_S)
+
+                print(f"\nTranslate {direction.upper()} at {s} mm/s for {DURATION_S:.1f}s "
+                      f"(theoretical: {signed_mm:+.1f} mm)")
                 cmd = robot.translate_for(speed_mm_s=s, duration_s=DURATION_S, direction=direction)
 
                 ts = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -132,6 +149,8 @@ def main():
                     s,
                     DURATION_S,
                     cmd,
+                    f"{abs_mm:.3f}",
+                    f"{signed_mm:.3f}",
                     "",   # <- fill this after measuring
                     "",   # <- optional notes
                 ])
