@@ -30,7 +30,7 @@ INTER_TEST_PAUSE_S = 1.0
 DURATION_S = 3.0
 SPEEDS_MM_S = [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75]
 
-RESULTS_CSV = Path("test\translation_accuracy_tables.csv")
+RESULTS_CSV = Path("test\data\translation_accuracy_tables.csv")
 
 
 def encode_translation(direction: str, speed_mm_s: float) -> int:
