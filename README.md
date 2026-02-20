@@ -3,6 +3,12 @@
 This repository contains a small Python controller that drives the AVIAR robot **over UDP** in **open loop**.  
 You control the robot in **physical units** (mm, deg) and **unsigned speeds** (mm/s, deg/s). The code converts these to the robot’s UDP command format.
 
+Current code layout:
+
+- Main controller/API: `control.py`
+- Communication + calibration scripts: `test/`
+- Calibration result tables: `test/data/`
+
 ---
 
 ## 1) System prerequisites
@@ -34,6 +40,11 @@ In the robot UI (UDP comm section):
 Allow UDP on your PC port:
 
 - UDP inbound: `54111`
+
+### Python
+
+- Python `3.10+` (the code uses hints like `float | None`)
+- No third-party dependencies (standard library only)
 
 ---
 
@@ -243,6 +254,7 @@ In code:
 - Default rotation rate: `90 deg/s`
 - Translation max speed: `50 mm/s`
 - Rotation gain: `k_rot = 1.5`
+- Default channel: `CH = 2`
 - Streaming rate: `TX_HZ = 100 Hz`
 
 If the robot behavior changes (different disposables, different load, different instrument),
@@ -257,19 +269,39 @@ you should re-run calibration and update:
 ## 8) Example usage
 
 ```python
+from control import AVIARRobot
+
 robot = AVIARRobot()
+try:
+    robot.clamp()
 
-robot.clamp()
+    robot.translate_by(+40)        # forward 40 mm @ default 25 mm/s
+    robot.translate_by(-20, 40)    # backward 20 mm @ 40 mm/s
 
-robot.translate_by(+40)        # forward 40 mm @ default 25 mm/s
-robot.translate_by(-20, 40)    # backward 20 mm @ 40 mm/s
+    robot.rotate_by(+90)           # CW 90 deg @ default 90 deg/s (quantized) with k_rot
+    robot.rotate_by(-180, 360)     # CCW 180 deg @ 360 deg/s with k_rot
 
-robot.rotate_by(+90)           # CW 90 deg @ default 90 deg/s (quantized) with k_rot
-robot.rotate_by(-180, 360)     # CCW 180 deg @ 360 deg/s with k_rot
-
-robot.release()
-robot.close()
+    robot.release()
+finally:
+    robot.close()
 ```
+
+### 8.1 Running the scripts in this repo
+
+From the repository root:
+
+```bash
+python3 control.py
+python3 test/test_communication.py
+python3 test/test_control.py
+python3 test/test_translation.py
+python3 test/test_rotation.py
+```
+
+Notes:
+
+- These are hardware-in-the-loop scripts (not unit tests).
+- `test/test_translation.py` and `test/test_rotation.py` append results into `test/data/*.csv`.
 
 ---
 
@@ -297,9 +329,14 @@ robot.close()
 
 ## 10) Files
 
-- `control.py` (or your main script): high-level API + encoding + example sequence
-- `translation_speed_sweep_results.csv`: output of translation calibration sweeps
-- `rotation_180deg_accuracy_vs_rate_with_kr.csv`: output of rotation calibration sweeps
+- `control.py`: high-level API + command encoding + demo motion sequence
+- `test/test_communication.py`: telemetry/connectivity sanity check
+- `test/test_control.py`: simple end-to-end sequence (clamp, translation, rotation, release)
+- `test/test_translation.py`: translation sweep script (logs expected/measured displacement)
+- `test/test_rotation.py`: 180-degree rotation sweep script with `k_r` compensation
+- `test/data/translation_accuracy_tables.csv`: translation sweep results
+- `test/data/rotation_accuracy_tables.csv`: rotation sweep results
+- `doc/AVIAR_User's Manual_LNR.pdf`: vendor/user manual copy
 
 ---
 
