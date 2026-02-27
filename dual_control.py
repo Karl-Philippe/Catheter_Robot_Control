@@ -14,8 +14,9 @@ LOCAL_BIND_PORT = 54111
 CH_GUIDE = 2   # guidewire
 CH_CATH  = 4   # catheter
 
-# Control timestep: 0.1 s (10 Hz)
+# Control timestep: 0.1 s total
 DT = 0.1
+SUB_DT = 0.05   # 0.05 s catheter + 0.05 s guidewire
 
 # =========================
 # CALIBRATION / LIMITS
@@ -41,6 +42,7 @@ def encode_translation_signed(speed_mm_s: float) -> int:
     base = 100 if s > 0 else 200
     return base + mag
 
+
 def encode_rotation_signed(rate_deg_s: float) -> tuple[int, float]:
     w = float(rate_deg_s)
     if abs(w) < 1e-9:
@@ -53,14 +55,16 @@ def encode_rotation_signed(rate_deg_s: float) -> tuple[int, float]:
     omega_eff = 10.0 * r
     return cmd, omega_eff
 
+
 # =========================
-# STEP COMMAND (per 0.1s)
+# STEP COMMAND (per 0.1 s)
 # =========================
 @dataclass
 class StepCmd:
     v2_mm_s: float   # CH2 translation speed (signed)
     w2_deg_s: float  # CH2 rotation rate (signed)
     v4_mm_s: float   # CH4 translation speed (signed)
+
 
 # =========================
 # LOG PARSER
@@ -120,10 +124,19 @@ def iter_stepcmds_from_log(
                 steps = max(1, int((t - next_t) // dt_target) + 1)
                 next_t = next_t + steps * dt_target
 
+
 # =========================
-# CONTROLLER (dual-channel)
+# CONTROLLER
 # =========================
 class AVIAREnvController:
+    """
+    Each control step (0.1 s) is split into:
+      1) CH4 catheter command for 0.05 s
+      2) CH2 guidewire command for 0.05 s
+
+    So they are NOT driven simultaneously.
+    """
+
     def __init__(self, apply_krot: bool = True):
         self.apply_krot = apply_krot
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -135,48 +148,67 @@ class AVIAREnvController:
         payload = f"{self.msg}/{ch}/{clamp}/{trans_cmd}/{rot_cmd}".encode("ascii")
         self.sock.sendto(payload, (ROBOT_IP, ROBOT_PORT))
 
+    def _hold_channel(self, ch: int, clamp: int, trans_cmd: int, rot_cmd: int, duration_s: float):
+        """
+        Hold one channel command for a given duration.
+        We repeatedly send the same frame during the hold window.
+        """
+        t_end = time.time() + duration_s
+        while time.time() < t_end:
+            self._send_frame(ch, clamp, trans_cmd, rot_cmd)
+            # small resend interval inside the hold window
+            time.sleep(0.01)
+
     def stop_all(self, duration_s: float = 0.3):
         t_end = time.time() + duration_s
         while time.time() < t_end:
             self._send_frame(CH_GUIDE, 0, 0, 0)
             self._send_frame(CH_CATH,  0, 0, 0)
-            time.sleep(DT)
+            time.sleep(0.01)
 
     def clamp_both(self):
         t_end = time.time() + CLAMP_TIME_S
         while time.time() < t_end:
-            self._send_frame(CH_GUIDE, 2, 0, 0)
-            self._send_frame(CH_CATH,  2, 0, 0)
-            time.sleep(DT)
+            # same time-sharing pattern even for clamp
+            self._hold_channel(CH_CATH,  2, 0, 0, SUB_DT)
+            self._hold_channel(CH_GUIDE, 2, 0, 0, SUB_DT)
         self.stop_all(SETTLE_S)
 
     def release_both(self):
         t_end = time.time() + RELEASE_TIME_S
         while time.time() < t_end:
-            self._send_frame(CH_GUIDE, 1, 0, 0)
-            self._send_frame(CH_CATH,  1, 0, 0)
-            time.sleep(DT)
+            self._hold_channel(CH_CATH,  1, 0, 0, SUB_DT)
+            self._hold_channel(CH_GUIDE, 1, 0, 0, SUB_DT)
         self.stop_all(SETTLE_S)
 
     def step(self, cmd: StepCmd):
-        # CH2
+        """
+        One 0.1 s control step:
+          - CH4 for 0.05 s
+          - CH2 for 0.05 s
+        """
+        # CH4 catheter translation
+        t4 = encode_translation_signed(cmd.v4_mm_s)
+
+        # CH2 guidewire translation + rotation
         t2 = encode_translation_signed(cmd.v2_mm_s)
         w2 = cmd.w2_deg_s
         if self.apply_krot and abs(w2) > 1e-9:
             w2 = w2 / K_ROT
         r2, _ = encode_rotation_signed(w2)
 
-        # CH4
-        t4 = encode_translation_signed(cmd.v4_mm_s)
+        # First catheter for 0.05 s
+        self._hold_channel(CH_CATH, 0, t4, 0, SUB_DT)
 
-        self._send_frame(CH_GUIDE, 0, t2, r2)
-        self._send_frame(CH_CATH,  0, t4, 0)
+        # Then guidewire for 0.05 s
+        self._hold_channel(CH_GUIDE, 0, t2, r2, SUB_DT)
 
     def close(self):
         try:
             self.stop_all(0.2)
         finally:
             self.sock.close()
+
 
 # =========================
 # RUNNERS
@@ -189,10 +221,12 @@ def _run_stream(ctrl: AVIAREnvController, stream: Iterator[StepCmd], max_steps: 
         n += 1
         if max_steps is not None and n >= max_steps:
             break
+
         dt_left = DT - (time.time() - t0)
         if dt_left > 0:
             time.sleep(dt_left)
     return n
+
 
 def run_from_log(log_path: str, max_steps: Optional[int] = None, assume_units: str = "deg"):
     ctrl = AVIAREnvController(apply_krot=True)
@@ -201,7 +235,11 @@ def run_from_log(log_path: str, max_steps: Optional[int] = None, assume_units: s
         print("Clamping CH2 and CH4...")
         ctrl.clamp_both()
 
-        n = _run_stream(ctrl, iter_stepcmds_from_log(log_path, dt_target=DT, assume_units=assume_units), max_steps=max_steps)
+        n = _run_stream(
+            ctrl,
+            iter_stepcmds_from_log(log_path, dt_target=DT, assume_units=assume_units),
+            max_steps=max_steps
+        )
 
         ctrl.stop_all(0.5)
         print("Releasing CH2 and CH4...")
@@ -210,6 +248,7 @@ def run_from_log(log_path: str, max_steps: Optional[int] = None, assume_units: s
         print(f"Done. Replayed {n} steps from {log_path}")
     finally:
         ctrl.close()
+
 
 def run_from_cmds(cmds: Sequence[StepCmd], max_steps: Optional[int] = None):
     ctrl = AVIAREnvController(apply_krot=True)
@@ -228,14 +267,15 @@ def run_from_cmds(cmds: Sequence[StepCmd], max_steps: Optional[int] = None):
     finally:
         ctrl.close()
 
+
 # =========================
-# MAIN (choose one)
+# MAIN
 # =========================
 if __name__ == "__main__":
     # Option A: replay from log file
     # run_from_log("data/control_logs.txt", max_steps=None, assume_units="deg")
 
-    # Option B: replay from an explicit list of StepCmd
+    # Option B: replay from explicit commands
     cmds = [
         StepCmd(v2_mm_s=+10, w2_deg_s=-90, v4_mm_s=+10),
         StepCmd(v2_mm_s=+10, w2_deg_s=-90, v4_mm_s=+10),
