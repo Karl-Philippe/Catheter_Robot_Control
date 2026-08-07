@@ -72,7 +72,7 @@ class StepCmd:
 def iter_stepcmds_from_log(
     log_path: str | Path,
     dt_target: float = 0.1,
-    assume_units: str = "deg",  # "deg" if guide_rotation_speed_cmd is deg/s; "rad" if rad/s
+    assume_units: str = "rad",  # "rad" if guide_rotation_speed_cmd is rad/s; "deg" if deg/s
 ) -> Iterator[StepCmd]:
     path = Path(log_path)
     if not path.exists():
@@ -228,7 +228,7 @@ def _run_stream(ctrl: AVIAREnvController, stream: Iterator[StepCmd], max_steps: 
     return n
 
 
-def run_from_log(log_path: str, max_steps: Optional[int] = None, assume_units: str = "deg"):
+def run_from_log(log_path: str, max_steps: Optional[int] = None, assume_units: str = "rad"):
     ctrl = AVIAREnvController(apply_krot=True)
     try:
         ctrl.stop_all(0.2)
@@ -273,7 +273,7 @@ def run_from_cmds(cmds: Sequence[StepCmd], max_steps: Optional[int] = None):
 # =========================
 if __name__ == "__main__":
     # Option A: replay from log file
-    # run_from_log("data/control_logs.txt", max_steps=None, assume_units="deg")
+    run_from_log("data/control_logs.txt", max_steps=None, assume_units="rad")
 
     # Option B: replay from explicit commands
     cmds = [
@@ -282,4 +282,4 @@ if __name__ == "__main__":
         StepCmd(v2_mm_s=+10, w2_deg_s=-30, v4_mm_s=+0),
         StepCmd(v2_mm_s=+10, w2_deg_s=0,   v4_mm_s=+0),
     ]
-    run_from_cmds(cmds)
+    #run_from_cmds(cmds)
