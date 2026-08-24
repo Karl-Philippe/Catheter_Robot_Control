@@ -29,6 +29,11 @@ from robot_core import (
 
 __all__ = ["AVIAREnvController", "StepCmd", "run_from_log", "run_from_cmds"]
 
+# Log columns this module reads (plus the optional "dt")
+TRANS_COL = "guide_speed_cmd"
+ROT_COL = "guide_rotation_speed_cmd"
+CATH_COL = "cath_speed_cmd"
+
 
 # =========================
 # CONTROLLER
@@ -149,7 +154,8 @@ def run_from_log(
 
         n = _run_stream(
             ctrl,
-            iter_stepcmds_from_log(log_path, default_dt=default_dt, assume_units=assume_units),
+            iter_stepcmds_from_log(log_path, TRANS_COL, ROT_COL, CATH_COL,
+                                   default_dt=default_dt, assume_units=assume_units),
             max_steps=max_steps
         )
 

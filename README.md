@@ -178,16 +178,23 @@ Examples:
 
 ### 5.2 Required columns
 
-Only these four are read. Every other column in the log is ignored.
+Each controller declares the columns it reads as constants at the top of its own file, and passes
+them to the shared parser. To change a header, edit those constants — nothing else. Every other
+column in the log is ignored.
 
-| Column | Unit | Used for | Required |
-| --- | --- | --- | --- |
-| `guide_rotation_speed_cmd` | **rad/s** | CH2 guidewire rotation | yes |
-| `guide_speed_cmd` | mm/s | CH2 guidewire translation | yes |
-| `cath_speed_cmd` | mm/s | CH4 catheter translation | yes |
-| `dt` | seconds | how long to hold that row's command | no — see §5.4 |
+| Controller | Constants | Columns read |
+| --- | --- | --- |
+| `control.py` (CH2) | `TRANS_COL`, `ROT_COL` | `device_translation_speed_cmd`, `device_rotation_speed_cmd` |
+| `dual_control.py` (CH2+CH4) | `TRANS_COL`, `ROT_COL`, `CATH_COL` | `guide_speed_cmd`, `guide_rotation_speed_cmd`, `cath_speed_cmd` |
 
-Columns present in the current logs but **not** used: `wall_time`, `run_id`, `pid`, `env_id`,
+Plus the optional `dt` column in both cases (§5.4). Translation columns are mm/s; rotation columns
+are **rad/s** by default (§5.3). Running the wrong log through a controller raises
+`Missing column '<name>'` naming the column it wanted.
+
+`control.py`'s form is instrument-agnostic on purpose: `device_*` is whichever tool is mounted on
+CH2, so the same log drives a guidewire or a catheter without renaming columns.
+
+Columns present in the recorded dual logs but **not** used: `wall_time`, `run_id`, `pid`, `env_id`,
 `episode`, `episode_step`, `sofa_step`, `action_rot`, `action_ins`, `rotation_cmd_deg`,
 `rotation_cmd_rad`.
 
@@ -342,21 +349,25 @@ This script never opens a socket and never commands the robot.
 `control.py` drives **CH2 (guidewire) only** and offers two ways in: the distance/angle API below,
 and the same speed+`dt` log replay as §5.
 
-### 7.0 Log replay on CH2
+### 7.0 Log replay on CH2 (one instrument)
 
 ```python
 from control import run_from_log
-run_from_log("data/control_logs.txt", assume_units="rad", default_dt=0.1)
+run_from_log("data/device_logs.txt", assume_units="rad", default_dt=0.1)
 ```
 
-Reads the same columns as §5.2, but `cath_speed_cmd` is **optional** here (it is parsed with
-`require_cath=False`) — a guidewire-only log with just `guide_rotation_speed_cmd`,
-`guide_speed_cmd` and `dt` replays fine, and `cath_speed_cmd` is ignored if present.
+Reads the columns named by `TRANS_COL` / `ROT_COL` at the top of `control.py`, plus the optional
+`dt` (§5.2). A dual log is rejected here — its columns have different names.
 
-Because only one channel is driven there is no time-sharing: translation and rotation go out in
-the **same frame** and both run for the whole `dt`, so a row covers exactly `v * dt` mm and
-`w * dt` deg, and a step occupies `dt` of wall-clock (not `2 * dt` as in §5.5). `robot.step(cmd)`
-executes a single `StepCmd` directly.
+**Motion is continuous.** Because only one channel is driven there is no time-sharing at all:
+translation and rotation go out in the **same frame** and both run for the whole `dt`, so a row
+covers exactly `v * dt` mm and `w * dt` deg, and a step occupies `dt` of wall-clock (not `2 * dt`
+as in §5.5). Rows are streamed back-to-back with no stop between them — the command simply changes
+at each row boundary while the axis keeps moving. The only stop is the final one before releasing
+the clamp.
+
+`INTERLEAVE` does **not** apply here: there is no second channel to alternate with, so it is a
+dual-channel concept only (§5.5). `robot.step(cmd)` executes a single `StepCmd` directly.
 
 ### Translation
 
@@ -468,8 +479,9 @@ Shared by both controllers, defined once in `robot_core.py`:
 
 - Default translation speed: `25 mm/s` (distance API only)
 - Default rotation rate: `90 deg/s` (angle API only)
-- Log replay: one row = `dt` of wall-clock, translation + rotation in the same frame
-- `cath_speed_cmd` optional in the log
+- Log replay: one row = `dt` of wall-clock, translation + rotation in the same frame, continuous
+  across rows (no stop between steps)
+- Log format: single-instrument `device_*` columns (§5.2); `INTERLEAVE` does not apply
 
 `dual_control.py` (two channels, log replay):
 
@@ -517,13 +529,13 @@ finally:
     robot.close()
 ```
 
-Speed + `dt` instead of distance, on CH2 only:
+Speed + `dt` instead of distance, on CH2 only — continuous, no stop between rows:
 
 ```python
 from control import run_from_log, run_from_cmds
 from robot_core import StepCmd
 
-run_from_log("data/control_logs.txt", assume_units="rad")
+run_from_log("data/device_logs.txt", assume_units="rad")   # single-instrument log
 
 run_from_cmds([
     StepCmd(v2_mm_s=+10, w2_deg_s=-90, v4_mm_s=0, dt=0.1),   # 1.0 mm, -9 deg
@@ -572,8 +584,13 @@ Cause: the log is being read as deg/s when it is rad/s. Check that `assume_units
 
 ### `Missing column '<name>' in log header`
 
-The log header doesn't contain one of the four required columns. Check the first line of your
-log against §5.2 — the parser matches names exactly and is whitespace-separated.
+The log header doesn't contain a required column. Check the first line of your log against §5.2 —
+the parser matches names exactly and is whitespace-separated.
+
+Most often this means the **wrong controller for the log**: the two formats use different column
+names, so a single-instrument log passed to `dual_control.py` (or vice versa) fails here. The error
+names the column that was expected — compare it against the constants at the top of the controller
+you ran (§5.2).
 
 ### The panel shows fewer steps than the replay executes
 
@@ -601,8 +618,9 @@ executes. `dual_control.py` no longer decimates: it replays **every** data row, 
 Controllers:
 
 - `robot_core.py`: **shared core** — network settings, calibration, command encoding, `StepCmd`,
-  the speed+`dt` log parser, and the UDP transport (`RobotLink`). Imported by both controllers, so
-  the encoders and parser exist in one place only.
+  the log parser (`iter_stepcmds_from_log`, caller-named columns), and the UDP transport
+  (`RobotLink`). Imported by both controllers, so the encoders and parser exist in one place only.
+  Contains no column names of its own.
 - `control.py`: single-channel (CH2) — distance/angle API, CH2 log replay, demo motion sequence
 - `dual_control.py`: dual-channel (CH2 + CH4) log replay, time-shared with the full `dt` per channel
 - `guidewire_panel.py`: pygame 4-quadrant visualization + MP4 export of a replay. Standalone — it
@@ -610,8 +628,9 @@ Controllers:
 
 Data:
 
-- `data/control_logs.txt`: current replay input log
-- `data/control_logs_V0.txt`: earlier run, same format
+- `data/control_logs.txt`: current replay input log, **two-instrument** format (`dual_control.py`)
+- `data/control_logs_V0.txt`: earlier run, same two-instrument format
+- `data/device_logs.txt`: one-instrument format (`control.py`)
 - `videos/`: rendered output from `guidewire_panel.py` (full panel + one file per quadrant)
 
 Tests and calibration (hardware-in-the-loop):

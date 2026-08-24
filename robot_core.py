@@ -106,20 +106,28 @@ class StepCmd:
 # =========================
 def iter_stepcmds_from_log(
     log_path: str | Path,
+    trans_col: str,
+    rot_col: str,
+    cath_col: str | None = None,
     default_dt: float = DEFAULT_DT,
-    assume_units: str = "rad",  # "rad" if guide_rotation_speed_cmd is rad/s; "deg" if deg/s
-    require_cath: bool = True,
+    assume_units: str = "rad",  # "rad" if the rotation column is rad/s, else "deg"
 ) -> Iterator[StepCmd]:
     """
-    Yield one StepCmd per data row. Each row is executed for its own duration,
-    taken from the "dt" column when the log has one, else from default_dt.
+    Yield one StepCmd per data row, held for the row's "dt" column (or
+    default_dt when the log has none). Rows with dt <= 0 are skipped.
 
-    require_cath=False lets a guidewire-only consumer (control.py, CH2) replay a
-    log that has no cath_speed_cmd column; v4_mm_s is then reported as 0.0.
+    The caller names the columns it wants, so each controller owns its own
+    header:
+      control.py       trans/rot only          -> v4_mm_s is 0.0
+      dual_control.py  trans/rot + cath_col    -> both channels
+
+    rot_col is converted rad/s -> deg/s when assume_units == "rad".
     """
     path = Path(log_path)
     if not path.exists():
         raise FileNotFoundError(f"Log not found: {path}")
+
+    wanted = [trans_col, rot_col] + ([cath_col] if cath_col else [])
 
     with path.open("r", encoding="utf-8") as f:
         header = None
@@ -131,16 +139,11 @@ def iter_stepcmds_from_log(
         if header is None:
             return
 
-        def idx(name: str) -> int:
+        for name in wanted:
             if name not in header:
                 raise ValueError(f"Missing column '{name}' in log header. Found: {header}")
-            return header.index(name)
-
-        i_w = idx("guide_rotation_speed_cmd")
-        i_v2 = idx("guide_speed_cmd")
-        i_v4 = idx("cath_speed_cmd") if require_cath else (
-            header.index("cath_speed_cmd") if "cath_speed_cmd" in header else None
-        )
+        i_trans, i_rot = header.index(trans_col), header.index(rot_col)
+        i_cath = header.index(cath_col) if cath_col else None
         # "dt" is optional: logs recorded before it existed fall back to default_dt
         i_dt = header.index("dt") if "dt" in header else None
 
@@ -152,18 +155,20 @@ def iter_stepcmds_from_log(
             if len(parts) < len(header):
                 continue
 
-            w = float(parts[i_w])
-            v2 = float(parts[i_v2])
-            v4 = 0.0 if i_v4 is None else float(parts[i_v4])
-
-            if assume_units == "rad":
-                w = w * DEG_PER_RAD
-
             dt = default_dt if i_dt is None else float(parts[i_dt])
             if dt <= 0:
                 continue
 
-            yield StepCmd(v2_mm_s=v2, w2_deg_s=w, v4_mm_s=v4, dt=dt)
+            w = float(parts[i_rot])
+            if assume_units == "rad":
+                w *= DEG_PER_RAD
+
+            yield StepCmd(
+                v2_mm_s=float(parts[i_trans]),
+                w2_deg_s=w,
+                v4_mm_s=0.0 if i_cath is None else float(parts[i_cath]),
+                dt=dt,
+            )
 
 
 # =========================

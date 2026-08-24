@@ -31,6 +31,10 @@ from robot_core import (
 # Channel this module drives
 CH = CH_GUIDE
 
+# Log columns this module reads (plus the optional "dt")
+TRANS_COL = "device_translation_speed_cmd"
+ROT_COL = "device_rotation_speed_cmd"
+
 # Defaults for the distance/angle API
 DEFAULT_TRANS_SPEED = 25      # mm/s
 DEFAULT_ROT_SPEED = 90        # deg/s
@@ -183,7 +187,13 @@ def run_from_log(
     assume_units: str = "rad",
     default_dt: float = DEFAULT_DT,
 ):
-    """Replay a log's guidewire columns on CH2. cath_speed_cmd is not required."""
+    """
+    Replay a log on CH2, reading TRANS_COL / ROT_COL (+ optional "dt").
+
+    Motion is continuous across rows: no stop is inserted between steps, so the
+    robot runs the whole sequence without pausing. The only stop is the final
+    one before releasing the clamp.
+    """
     robot = AVIARRobot()
     try:
         robot.stop(0.2)
@@ -192,11 +202,12 @@ def run_from_log(
 
         n = _run_stream(
             robot,
-            iter_stepcmds_from_log(log_path, default_dt=default_dt,
-                                   assume_units=assume_units, require_cath=False),
+            iter_stepcmds_from_log(log_path, TRANS_COL, ROT_COL,
+                                   default_dt=default_dt, assume_units=assume_units),
             max_steps=max_steps
         )
 
+        # halt before unclamping (not a mid-sequence pause)
         robot.stop(0.5)
         print("Releasing CH2...")
         robot.release()
@@ -256,5 +267,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-    # Or replay a log on CH2 (speeds + dt per row):
-    #run_from_log("data/control_logs.txt", assume_units="rad", default_dt=DEFAULT_DT)
+    # Or replay a ONE-instrument log on CH2 (continuous, speeds + dt per row).
+    # Header: dt  device_translation_speed_cmd  device_rotation_speed_cmd
+    #run_from_log("data/device_logs.txt", assume_units="rad", default_dt=DEFAULT_DT)
