@@ -26,8 +26,23 @@ CH_CATH  = 4   # catheter
 # Control timestep: used when a log row carries no "dt" column
 DEFAULT_DT = 0.1
 
-# Frame resend interval inside a hold window
+# Frame resend interval inside a hold window.
+# The robot is driven by a continuous stream: a datagram is not a latched
+# command, so a held command is re-sent every TX_DT (100 Hz) to keep the axis
+# moving and to make a dropped datagram cost 10 ms instead of the whole move.
+# This is the refresh rate, NOT the channel alternation rate (see INTERLEAVE).
 TX_DT = 0.01
+
+# How finely dual_control alternates between CH4 and CH2 within one log row.
+# Each row's dt is cut into INTERLEAVE slices per channel, alternating
+# CH4/CH2/CH4/CH2..., so the swap period is dt/INTERLEAVE instead of dt.
+# Each channel still accumulates the full dt of motion, so displacement is
+# unchanged -- only the interleaving granularity changes.
+#   1  = one CH4 block then one CH2 block (coarsest, maximally out of phase)
+#   4  = 8 swaps per row, the channels track each other much more closely
+# A slice shorter than TX_DT degenerates to a single frame, so keep
+# dt/INTERLEAVE >= TX_DT.
+INTERLEAVE = 4
 
 # =========================
 # CALIBRATION / LIMITS

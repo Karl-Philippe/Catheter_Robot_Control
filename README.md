@@ -8,7 +8,7 @@ There are two ways to drive the robot:
 1. **Scripted motion** (`control.py`) — you call `translate_by()` / `rotate_by()` with physical
    distances and angles on a single channel.
 2. **Log replay** (`dual_control.py`) — you replay a recorded simulation log, which drives the
-   guidewire (CH2) and catheter (CH4) together at a fixed 0.1 s timestep. See §5.
+   guidewire (CH2) and catheter (CH4) together, one move per log row for that row's `dt`. See §5.
 
 Current code layout:
 
@@ -180,15 +180,16 @@ Examples:
 
 Only these four are read. Every other column in the log is ignored.
 
-| Column | Unit | Used for |
-| --- | --- | --- |
-| `wall_time` | epoch seconds | step pacing / decimation to `DT` |
-| `guide_rotation_speed_cmd` | **rad/s** | CH2 guidewire rotation |
-| `guide_speed_cmd` | mm/s | CH2 guidewire translation |
-| `cath_speed_cmd` | mm/s | CH4 catheter translation |
+| Column | Unit | Used for | Required |
+| --- | --- | --- | --- |
+| `guide_rotation_speed_cmd` | **rad/s** | CH2 guidewire rotation | yes |
+| `guide_speed_cmd` | mm/s | CH2 guidewire translation | yes |
+| `cath_speed_cmd` | mm/s | CH4 catheter translation | yes |
+| `dt` | seconds | how long to hold that row's command | no — see §5.4 |
 
-Columns present in the current logs but **not** used: `run_id`, `pid`, `env_id`, `episode`,
-`episode_step`, `sofa_step`, `action_rot`, `action_ins`, `rotation_cmd_deg`, `rotation_cmd_rad`.
+Columns present in the current logs but **not** used: `wall_time`, `run_id`, `pid`, `env_id`,
+`episode`, `episode_step`, `sofa_step`, `action_rot`, `action_ins`, `rotation_cmd_deg`,
+`rotation_cmd_rad`.
 
 ### 5.3 Rotation units (important)
 
@@ -203,20 +204,86 @@ Equivalently, `guide_rotation_speed_cmd` in deg/s equals `rotation_cmd_deg / DT`
 > `-4.59` gets treated as `-4.59 deg/s`, which rounds to `r=0`, is clamped up to `r=1`, and
 > commands a flat 10 deg/s for nearly every step regardless of the log.
 
-### 5.4 Timestep and decimation
+### 5.4 Timestep (`dt`)
 
-Log rows are decimated onto a fixed grid using `wall_time`: the first row starts the grid, and
-one `StepCmd` is emitted per `dt_target` window. `dual_control.py` uses `dt_target = DT = 0.1 s`,
-matching the robot control step.
+**One log row = one robot move.** Every data row is replayed, in file order, and each row is
+executed for its own duration:
+
+- If the log has a `dt` column, that row's `dt` (in seconds) is the hold duration.
+- If it does not, every row falls back to `default_dt`, which defaults to `DEFAULT_DT = 0.1 s`.
+  This keeps the existing `data/control_logs.txt` and `data/control_logs_V0.txt` replayable
+  unchanged, at the 0.1 s step they were recorded at.
+
+Rows with `dt <= 0` are skipped. `wall_time` is no longer read at all — earlier versions used it
+to decimate rows onto a fixed 0.1 s grid, which could drop rows; the `dt` column now carries the
+timing explicitly, so the replay is driven by the file rather than by recording wall-clock.
+
+Override the fallback per run:
+
+```python
+run_from_log("data/control_logs.txt", assume_units="rad", default_dt=0.05)
+```
 
 ### 5.5 How a step is executed
 
-The two channels are **not** driven simultaneously. Each 0.1 s step is time-shared:
+The two channels are **not** driven simultaneously. Each step of duration `dt` is time-shared, and
+each channel gets the **full** `dt`, split into `INTERLEAVE` alternating slices of
+`dt / INTERLEAVE` each:
 
-1. CH4 (catheter) translation held for `SUB_DT` = 0.05 s
-2. CH2 (guidewire) translation + rotation held for `SUB_DT` = 0.05 s
+1. CH4 (catheter) translation for `dt / INTERLEAVE`
+2. CH2 (guidewire) translation + rotation for `dt / INTERLEAVE`
+3. ... repeated `INTERLEAVE` times
 
-Frames are resent every 0.01 s inside each hold window.
+At the default `INTERLEAVE = 1` that is simply one CH4 block then one CH2 block. Frames are resent
+every `TX_DT` = 0.01 s inside each hold window, and at least one frame is always sent per channel
+even when a slice is shorter than that. The runner adds no extra pacing sleep on top.
+
+#### `TX_DT` vs `INTERLEAVE` — two different rates
+
+These are easy to conflate but do unrelated jobs:
+
+| Constant | Default | What it controls |
+| --- | --- | --- |
+| `TX_DT` | 0.01 s | **Refresh rate.** How often a *held* command is re-sent. |
+| `INTERLEAVE` | 1 | **Alternation rate.** How many times the step swaps CH4↔CH2. |
+
+`TX_DT` is still doing real work: the robot is driven by a continuous stream, so a datagram is not
+a latched command. Re-sending at 100 Hz keeps the axis moving for the whole hold and caps the cost
+of a dropped datagram at 10 ms instead of the entire move. It has nothing to do with which channel
+is active.
+
+`INTERLEAVE` changes only how finely the channels alternate — **not** how far they travel. Each
+channel still accumulates a full `dt`, so displacement is identical at every setting, and the step
+still occupies `2 * dt` of wall-clock:
+
+| `INTERLEAVE` | Slice at `dt = 0.2 s` | Swaps per row | Guidewire travel @ 10 mm/s |
+| --- | --- | --- | --- |
+| 1 | 200 ms | 2 | 2.0 mm |
+| 4 | 50 ms | 8 | 2.0 mm |
+| 10 | 20 ms | 20 | 2.0 mm |
+
+Raise it when you want the two channels to track each other more closely instead of moving in one
+long block each. The constants do interact at the bottom end: a slice shorter than `TX_DT`
+degenerates to a single frame, so keep `dt / INTERLEAVE >= TX_DT` (at `dt = 0.1 s` that caps
+`INTERLEAVE` at 10).
+
+```python
+run_from_log("data/control_logs.txt", assume_units="rad", interleave=4)
+```
+
+Or change the `INTERLEAVE` default in `robot_core.py` to affect every replay.
+
+#### Why the full `dt`, not `dt / 2`
+
+Time-sharing is physically real: a channel only moves while it is the one being commanded. Giving
+each channel `dt / 2` therefore covers **half** the commanded displacement — a row asking for
+10 mm/s over `dt = 0.1 s` should advance 1.0 mm but only advances 0.5 mm. Over the 39 rows of
+`data/control_logs_V0.txt` that is 19.5 mm of guidewire insertion instead of 39 mm.
+
+Holding each channel for the full `dt` restores the exact commanded distance (`v * dt`) and angle
+(`w * dt`) without inflating the speeds into the protocol clamps. The trade-off is wall-clock: a
+step occupies `2 * dt`, so a dual-channel replay runs at half real-time. Single-channel replay in
+`control.py` has no such trade-off (§7).
 
 ### 5.6 Running a replay
 
@@ -235,13 +302,13 @@ You can also bypass the log entirely and replay an explicit list:
 
 ```python
 run_from_cmds([
-    StepCmd(v2_mm_s=+10, w2_deg_s=-90, v4_mm_s=+10),
-    StepCmd(v2_mm_s=+10, w2_deg_s=-30, v4_mm_s=+0),
+    StepCmd(v2_mm_s=+10, w2_deg_s=-90, v4_mm_s=+10, dt=0.1),
+    StepCmd(v2_mm_s=+10, w2_deg_s=-30, v4_mm_s=+0,  dt=0.5),
 ])
 ```
 
 Note that `StepCmd.w2_deg_s` is in **deg/s** — the rad→deg conversion happens in the parser, not
-in `StepCmd`.
+in `StepCmd`. `StepCmd.dt` defaults to `DEFAULT_DT` (0.1 s) when omitted.
 
 ---
 
@@ -258,8 +325,9 @@ Configuration is at the top of the file:
 
 - `LOG_PATH` — log to visualize (default `data/control_logs.txt`)
 - `ASSUME_UNITS` — `"rad"`, matching `dual_control.py`
-- `DT_TARGET` — `0.2`, deliberately **2x** the robot's `DT = 0.1` for visual clarity, so the
-  panel shows half as many steps as the robot actually executes
+- `DT_TARGET` — `0.2`, deliberately **2x** the 0.1 s recording step for visual clarity, so the
+  panel shows half as many steps as the robot actually executes. The panel keeps its own
+  `wall_time`-based decimation; only `dual_control.py` switched to per-row `dt`.
 - `RESOLUTION` — `"SD"` / `"HD"` / `"FHD"` / `"2K"` / `"4K"`
 - `VIDEO_EXPORT` — `True` writes `videos/guidewire_replay.mp4` offscreen; `False` opens an
   interactive pygame window
@@ -271,8 +339,24 @@ This script never opens a socket and never commands the robot.
 
 ## 7) High-level Python API (`control.py`)
 
-For scripted motion, `control.py` exposes a clean API. (For log replay, see §5 instead — that
-path takes speeds from the log rather than distances from you.)
+`control.py` drives **CH2 (guidewire) only** and offers two ways in: the distance/angle API below,
+and the same speed+`dt` log replay as §5.
+
+### 7.0 Log replay on CH2
+
+```python
+from control import run_from_log
+run_from_log("data/control_logs.txt", assume_units="rad", default_dt=0.1)
+```
+
+Reads the same columns as §5.2, but `cath_speed_cmd` is **optional** here (it is parsed with
+`require_cath=False`) — a guidewire-only log with just `guide_rotation_speed_cmd`,
+`guide_speed_cmd` and `dt` replays fine, and `cath_speed_cmd` is ignored if present.
+
+Because only one channel is driven there is no time-sharing: translation and rotation go out in
+the **same frame** and both run for the whole `dt`, so a row covers exactly `v * dt` mm and
+`w * dt` deg, and a step occupies `dt` of wall-clock (not `2 * dt` as in §5.5). `robot.step(cmd)`
+executes a single `StepCmd` directly.
 
 ### Translation
 
@@ -369,26 +453,30 @@ Robot command frames streamed for `CLAMP_TIME_S`:
 
 ## 9) Defaults and calibration constants
 
-Shared by both controllers:
+Shared by both controllers, defined once in `robot_core.py`:
 
 - Translation max speed: `TRANS_SPEED_MAX = 50 mm/s`
+- Rotation rate ceiling: `ROT_RATE_MAX = 360 deg/s`
 - Rotation gain: `K_ROT = 1.5`
+- Guidewire channel `CH_GUIDE = 2`, catheter channel `CH_CATH = 4`
+- Fallback timestep: `DEFAULT_DT = 0.1 s` (used when a log has no `dt` column)
+- Resend interval inside a hold window: `TX_DT = 0.01 s` (100 Hz refresh, not alternation)
+- Channel alternation granularity: `INTERLEAVE = 1` (dual-channel only — see §5.5)
+- Clamp/release/settle: `CLAMP_TIME_S = RELEASE_TIME_S = 2.5 s`, `SETTLE_S = 0.2 s`
 
-`control.py` (single channel, scripted):
+`control.py` (single channel, CH2):
 
-- Default translation speed: `25 mm/s`
-- Default rotation rate: `90 deg/s`
-- Channel: `CH = 2`
-- Streaming rate: `TX_HZ = 100 Hz` (resend every 10 ms)
+- Default translation speed: `25 mm/s` (distance API only)
+- Default rotation rate: `90 deg/s` (angle API only)
+- Log replay: one row = `dt` of wall-clock, translation + rotation in the same frame
+- `cath_speed_cmd` optional in the log
 
 `dual_control.py` (two channels, log replay):
 
-- Guidewire channel: `CH_GUIDE = 2`
-- Catheter channel: `CH_CATH = 4`
-- Control step: `DT = 0.1 s`, split into `SUB_DT = 0.05 s` per channel
-- Resend interval inside a hold window: 10 ms
-- Rotation rate ceiling: `ROT_RATE_MAX = 360 deg/s`
+- Control step: per-row `dt` in full on each channel, alternating in `INTERLEAVE` slices
+  (`2 * dt` wall-clock, displacement independent of `INTERLEAVE`)
 - No default speeds — every value comes from the log
+- `cath_speed_cmd` required in the log
 
 ### 9.1 Two ways of applying `K_ROT`
 
@@ -397,8 +485,8 @@ at different points, because one controls duration and the other does not:
 
 - `control.py` picks its own duration, so it compensates there:
   `t = |theta| / (K_ROT * omega_eff)` — commands the requested rate for a shorter time.
-- `dual_control.py` is locked to a fixed `DT` per log step, so it compensates the rate instead:
-  `w_cmd = w_des / K_ROT` — commands a slower rate for the full step.
+- `dual_control.py` takes each step's duration from the log (`dt`), so it compensates the rate
+  instead: `w_cmd = w_des / K_ROT` — commands a slower rate for the full step.
 
 These are equivalent: holding `w_des / K_ROT` for `t` sweeps the same angle as holding `w_des`
 for `t / K_ROT`. The difference is not a discrepancy between the two files.
@@ -427,6 +515,20 @@ try:
     robot.release()
 finally:
     robot.close()
+```
+
+Speed + `dt` instead of distance, on CH2 only:
+
+```python
+from control import run_from_log, run_from_cmds
+from robot_core import StepCmd
+
+run_from_log("data/control_logs.txt", assume_units="rad")
+
+run_from_cmds([
+    StepCmd(v2_mm_s=+10, w2_deg_s=-90, v4_mm_s=0, dt=0.1),   # 1.0 mm, -9 deg
+    StepCmd(v2_mm_s=+10, w2_deg_s=-30, v4_mm_s=0, dt=0.5),   # 5.0 mm, -15 deg
+])
 ```
 
 ### 10.1 Running the scripts in this repo
@@ -473,11 +575,12 @@ Cause: the log is being read as deg/s when it is rad/s. Check that `assume_units
 The log header doesn't contain one of the four required columns. Check the first line of your
 log against §5.2 — the parser matches names exactly and is whitespace-separated.
 
-### Replay runs but far fewer steps than the log has rows
+### The panel shows fewer steps than the replay executes
 
-Expected. Rows are decimated onto the `dt_target` grid using `wall_time` (§5.4). The panel uses
-`DT_TARGET = 0.2` while the robot uses `DT = 0.1`, so the video shows about half the steps the
-robot executes.
+Expected, and it applies to `guidewire_panel.py` only. The panel still decimates rows onto its own
+`DT_TARGET = 0.2` grid using `wall_time`, so the video shows about half the steps the robot
+executes. `dual_control.py` no longer decimates: it replays **every** data row, one move per row
+(§5.4).
 
 ### No telemetry
 
@@ -497,9 +600,13 @@ robot executes.
 
 Controllers:
 
-- `control.py`: high-level API + command encoding + demo motion sequence (single channel)
-- `dual_control.py`: dual-channel (CH2 + CH4) log replay with time-shared 0.1 s steps
-- `guidewire_panel.py`: pygame 4-quadrant visualization + MP4 export of a replay
+- `robot_core.py`: **shared core** — network settings, calibration, command encoding, `StepCmd`,
+  the speed+`dt` log parser, and the UDP transport (`RobotLink`). Imported by both controllers, so
+  the encoders and parser exist in one place only.
+- `control.py`: single-channel (CH2) — distance/angle API, CH2 log replay, demo motion sequence
+- `dual_control.py`: dual-channel (CH2 + CH4) log replay, time-shared with the full `dt` per channel
+- `guidewire_panel.py`: pygame 4-quadrant visualization + MP4 export of a replay. Standalone — it
+  keeps its own parser copy and still decimates on `wall_time`, so it does not use `dt`.
 
 Data:
 

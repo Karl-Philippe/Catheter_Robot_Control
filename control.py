@@ -258,5 +258,3 @@ if __name__ == "__main__":
 
     # Or replay a log on CH2 (speeds + dt per row):
     #run_from_log("data/control_logs.txt", assume_units="rad", default_dt=DEFAULT_DT)
-
-

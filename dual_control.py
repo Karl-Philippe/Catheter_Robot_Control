@@ -15,6 +15,7 @@ from robot_core import (
     CH_GUIDE,
     CLAMP_TIME_S,
     DEFAULT_DT,
+    INTERLEAVE,
     K_ROT,
     RELEASE_TIME_S,
     SETTLE_S,
@@ -34,21 +35,28 @@ __all__ = ["AVIAREnvController", "StepCmd", "run_from_log", "run_from_cmds"]
 # =========================
 class AVIAREnvController:
     """
-    Each control step of duration dt is time-shared between the channels:
-      1) CH4 catheter command held for the full dt
-      2) CH2 guidewire command held for the full dt
+    Each control step of duration dt is time-shared between the channels. The
+    step is cut into `interleave` slices per channel, alternating
+    CH4/CH2/CH4/CH2..., each slice lasting dt/interleave.
 
     So they are NOT driven simultaneously, and a step occupies 2*dt of
-    wall-clock.
+    wall-clock regardless of `interleave`.
 
-    Displacement: each channel is energised for the whole dt, so a row asking
+    Displacement: each channel is energised for a total of dt, so a row asking
     for v mm/s over dt advances v*dt mm on that channel, as recorded. Splitting
     dt in half between the channels instead would have moved only half the
     commanded distance on each.
+
+    `interleave` therefore changes only HOW FINELY the channels alternate, not
+    how far they travel:
+      1 = one CH4 block then one CH2 block (default, coarsest)
+      4 = 8 swaps per row, the two channels track each other far more closely
+    Keep dt/interleave >= TX_DT or each slice degenerates to a single frame.
     """
 
-    def __init__(self, apply_krot: bool = True):
+    def __init__(self, apply_krot: bool = True, interleave: int = INTERLEAVE):
         self.apply_krot = apply_krot
+        self.interleave = max(1, int(interleave))
         self.link = RobotLink()
 
     def _send_frame(self, ch: int, clamp: int, trans_cmd: int, rot_cmd: int):
@@ -81,10 +89,11 @@ class AVIAREnvController:
 
     def step(self, cmd: StepCmd):
         """
-        One control step:
-          - CH4 for cmd.dt
-          - CH2 for cmd.dt
-        Total wall-clock 2*cmd.dt; each channel moves its full commanded amount.
+        One control step, alternating CH4/CH2 `interleave` times:
+          - CH4 for cmd.dt / interleave
+          - CH2 for cmd.dt / interleave
+          ... repeated `interleave` times
+        Each channel accumulates cmd.dt in total; wall-clock is 2*cmd.dt.
         """
         dt = float(cmd.dt)
 
@@ -98,11 +107,11 @@ class AVIAREnvController:
             w2 = w2 / K_ROT
         r2, _ = encode_rotation_signed(w2)
 
-        # First catheter for dt
-        self._hold_channel(CH_CATH, 0, t4, 0, dt)
-
-        # Then guidewire for dt
-        self._hold_channel(CH_GUIDE, 0, t2, r2, dt)
+        slice_s = dt / self.interleave
+        for _ in range(self.interleave):
+            # catheter slice, then guidewire slice
+            self._hold_channel(CH_CATH, 0, t4, 0, slice_s)
+            self._hold_channel(CH_GUIDE, 0, t2, r2, slice_s)
 
     def close(self):
         try:
@@ -130,8 +139,9 @@ def run_from_log(
     max_steps: Optional[int] = None,
     assume_units: str = "rad",
     default_dt: float = DEFAULT_DT,
+    interleave: int = INTERLEAVE,
 ):
-    ctrl = AVIAREnvController(apply_krot=True)
+    ctrl = AVIAREnvController(apply_krot=True, interleave=interleave)
     try:
         ctrl.stop_all(0.2)
         print("Clamping CH2 and CH4...")
@@ -152,8 +162,9 @@ def run_from_log(
         ctrl.close()
 
 
-def run_from_cmds(cmds: Sequence[StepCmd], max_steps: Optional[int] = None):
-    ctrl = AVIAREnvController(apply_krot=True)
+def run_from_cmds(cmds: Sequence[StepCmd], max_steps: Optional[int] = None,
+                  interleave: int = INTERLEAVE):
+    ctrl = AVIAREnvController(apply_krot=True, interleave=interleave)
     try:
         ctrl.stop_all(0.2)
         print("Clamping CH2 and CH4...")
@@ -176,8 +187,9 @@ def run_from_cmds(cmds: Sequence[StepCmd], max_steps: Optional[int] = None):
 if __name__ == "__main__":
     # Option A: replay from log file.
     # Rows use the log's "dt" column; logs without one fall back to default_dt.
+    # Raise interleave (e.g. 4) to alternate CH4/CH2 more finely within each row.
     run_from_log("data/control_logs.txt", max_steps=None, assume_units="rad",
-                 default_dt=DEFAULT_DT)
+                 default_dt=DEFAULT_DT, interleave=INTERLEAVE)
 
     # Option B: replay from explicit commands (dt is per-command)
     cmds = [
