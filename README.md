@@ -3,17 +3,27 @@
 This repository contains a small Python controller that drives the AVIAR robot **over UDP** in **open loop**.  
 You control the robot in **physical units** (mm, deg) and **unsigned speeds** (mm/s, deg/s). The code converts these to the robot’s UDP command format.
 
-There are two ways to drive the robot:
+The code is a small **library** plus three **use-case scripts** built on it:
 
-1. **Scripted motion** (`control.py`) — you call `translate_by()` / `rotate_by()` with physical
-   distances and angles on a single channel.
-2. **Log replay** (`dual_control.py`) — you replay a recorded simulation log, which drives the
-   guidewire (CH2) and catheter (CH4) together, one move per log row for that row's `dt`. See §5.
+```
+aviar/              the library (see §7)
+  config.py         constants and Params  -- edit tuning values here
+  protocol.py       command encoding, StepCmd
+  link.py           RobotLink, the UDP transport
+  robot.py          Robot, the controller
+  logs.py           reading recorded logs
+  replay.py         running a StepCmd stream
 
-Current code layout:
+control.py          USE CASE: replay a 1-instrument log on CH2          (§5)
+dual_control.py     USE CASE: replay a 2-instrument log on CH4+CH2      (§5)
+manual_control.py   USE CASE: drive one channel by hand, in mm and deg  (§7.2)
+```
 
-- Scripted controller/API: `control.py`
-- Dual-channel log replay: `dual_control.py`
+Each script is ~40 lines: it names its log columns or its list of moves, and calls the library.
+All the machinery lives in `aviar/`.
+
+Supporting files:
+
 - Replay visualization / video export: `guidewire_panel.py`
 - Input logs for replay: `data/`
 - Communication + calibration scripts: `test/`
@@ -225,11 +235,13 @@ Rows with `dt <= 0` are skipped. `wall_time` is no longer read at all — earlie
 to decimate rows onto a fixed 0.1 s grid, which could drop rows; the `dt` column now carries the
 timing explicitly, so the replay is driven by the file rather than by recording wall-clock.
 
-Override the fallback per run:
+Override the fallback where the parser is called (the scripts leave it at `DEFAULT_DT`):
 
 ```python
-run_from_log("data/control_logs.txt", assume_units="rad", default_dt=0.05)
+iter_stepcmds_from_log(LOG_PATH, TRANS_COL, ROT_COL, default_dt=0.05)
 ```
+
+Or change `DEFAULT_DT` in `aviar/config.py` to affect every replay.
 
 ### 5.5 How a step is executed
 
@@ -275,10 +287,12 @@ degenerates to a single frame, so keep `dt / INTERLEAVE >= TX_DT` (at `dt = 0.1 
 `INTERLEAVE` at 10).
 
 ```python
-run_from_log("data/control_logs.txt", assume_units="rad", interleave=4)
+INTERLEAVE = 4              # SETTINGS block of dual_control.py
 ```
 
-Or change the `INTERLEAVE` default in `robot_core.py` to affect every replay.
+`control.py` has no `INTERLEAVE`: with one channel there is nothing to alternate with.
+
+Or change the `INTERLEAVE` default in `aviar/config.py` to affect every replay.
 
 #### Why the full `dt`, not `dt / 2`
 
@@ -298,17 +312,19 @@ step occupies `2 * dt`, so a dual-channel replay runs at half real-time. Single-
 python3 dual_control.py
 ```
 
-This clamps both channels, replays `data/control_logs.txt`, then releases. To do a short dry run
-first, edit the call at the bottom of the file:
+This clamps both channels, replays `data/control_logs.txt`, then releases. For a short dry run,
+edit the SETTINGS block:
 
 ```python
-run_from_log("data/control_logs.txt", max_steps=20, assume_units="rad")
+MAX_STEPS = 20              # None = the whole log
 ```
 
-You can also bypass the log entirely and replay an explicit list:
+You can also bypass the log and replay an explicit list, straight against the library:
 
 ```python
-run_from_cmds([
+from aviar import CH_CATH, CH_GUIDE, Robot, StepCmd, replay
+
+replay(Robot(channels=(CH_CATH, CH_GUIDE)), [
     StepCmd(v2_mm_s=+10, w2_deg_s=-90, v4_mm_s=+10, dt=0.1),
     StepCmd(v2_mm_s=+10, w2_deg_s=-30, v4_mm_s=+0,  dt=0.5),
 ])
@@ -344,17 +360,78 @@ This script never opens a socket and never commands the robot.
 
 ---
 
-## 7) High-level Python API (`control.py`)
+## 7) The `aviar` library
 
-`control.py` drives **CH2 (guidewire) only** and offers two ways in: the distance/angle API below,
-and the same speed+`dt` log replay as §5.
-
-### 7.0 Log replay on CH2 (one instrument)
+Everything importable lives in `aviar/`. The scripts in the repository root are use cases built on
+it; write your own the same way.
 
 ```python
-from control import run_from_log
-run_from_log("data/device_logs.txt", assume_units="rad", default_dt=0.1)
+from aviar import Robot, StepCmd, replay, iter_stepcmds_from_log, CH_GUIDE, CH_CATH
 ```
+
+| Module | Holds | Touches |
+| --- | --- | --- |
+| `aviar/config.py` | constants + `Params` | nothing (leaf) |
+| `aviar/protocol.py` | `encode_*`, `StepCmd`, clamp values | pure functions, unit-testable |
+| `aviar/link.py` | `RobotLink` | the **only** socket in the package |
+| `aviar/robot.py` | `Robot` | the controller |
+| `aviar/logs.py` | `iter_stepcmds_from_log` | file reading |
+| `aviar/replay.py` | `replay()` | one clamped session |
+
+### 7.1 `Robot` — one class, channel-driven
+
+```python
+Robot()                              # CH2 alone      — control.py
+Robot(channels=(CH_CATH, CH_GUIDE))  # CH4 then CH2   — dual_control.py
+Robot(channels=(CH_CATH,))           # any one channel — manual_control.py
+```
+
+`channels` is in **command order**. Only `step()` depends on how many channels there are;
+clamp/release/stop, the calibration moves and `replay()` work the same either way.
+
+Two ways to command motion:
+
+| Method | You give | Used by |
+| --- | --- | --- |
+| `step(cmd)` | speed + duration (one `StepCmd`) | log replay, continuous |
+| `translate_by` / `rotate_by` | distance + speed | calibration, settles after each move |
+
+`Robot` is a context manager, so `with Robot() as robot:` closes the socket for you.
+
+The calibration moves act on `cal_channel` — the guidewire whenever this `Robot` drives it, else
+the single channel it does drive. Deliberately *not* `channels[0]`, which is the catheter when
+both are driven. Pass `channel=` to override per move.
+
+### 7.2 `manual_control.py` — driving by hand
+
+Edit the two blocks at the top and run it:
+
+```python
+CHANNEL = CH_GUIDE      # or CH_CATH
+
+SEQUENCE = [
+    ("translate_by", (+40,)),        # 40 mm forward @ default 25 mm/s
+    ("translate_by", (-40, 35)),     # 40 mm backward @ 35 mm/s
+    ("rotate_by",    (+180,)),       # 180 deg CW @ default 90 deg/s
+    ("rotate_by",    (-180, 360)),   # 180 deg CCW @ 360 deg/s
+]
+```
+
+```bash
+python3 manual_control.py
+```
+
+It clamps, runs each move in order, and releases. Each move settles for `SETTLE_S` afterwards, so
+these are **discrete** positioning moves — deliberately not the continuous path used for replay.
+
+### 7.3 Log replay on CH2 (one instrument)
+
+```bash
+python3 control.py
+```
+
+Everything it does is set in the SETTINGS block at the top of the file — the log path, the
+column names, and `MAX_STEPS`. `main()` takes no arguments: edit the block, run the file.
 
 Reads the columns named by `TRANS_COL` / `ROT_COL` at the top of `control.py`, plus the optional
 `dt` (§5.2). A dual log is rejected here — its columns have different names.
@@ -368,6 +445,8 @@ the clamp.
 
 `INTERLEAVE` does **not** apply here: there is no second channel to alternate with, so it is a
 dual-channel concept only (§5.5). `robot.step(cmd)` executes a single `StepCmd` directly.
+
+### 7.4 Calibration moves
 
 ### Translation
 
@@ -464,7 +543,7 @@ Robot command frames streamed for `CLAMP_TIME_S`:
 
 ## 9) Defaults and calibration constants
 
-Shared by both controllers, defined once in `robot_core.py`:
+All defined once in `aviar/config.py`:
 
 - Translation max speed: `TRANS_SPEED_MAX = 50 mm/s`
 - Rotation rate ceiling: `ROT_RATE_MAX = 360 deg/s`
@@ -501,20 +580,23 @@ at different points, because one controls duration and the other does not:
   instead: `w_cmd = w_des / K_ROT` — commands a slower rate for the full step.
 
 These are equivalent: holding `w_des / K_ROT` for `t` sweeps the same angle as holding `w_des`
-for `t / K_ROT`. The difference is not a discrepancy between the two files.
+for `t / K_ROT`. Both live on the same class — `rotate_by` shortens the duration, `step()`
+compensates the rate — so this is a deliberate difference between the two methods, not a
+discrepancy between files.
 
 If the robot behavior changes (different disposables, different load, different instrument),
 re-run calibration and update `K_ROT` (and `TRANS_SPEED_MAX` / default speeds if needed) in
-**both** files — they hold independent copies of these constants.
+`aviar/config.py` — there is a single copy, read by every entry point. Per-run overrides go
+through `Params`, e.g. `Robot(params=Params(k_rot=1.8))`.
 
 ---
 
 ## 10) Example usage
 
 ```python
-from control import AVIARRobot
+from aviar import Robot
 
-robot = AVIARRobot()
+robot = Robot()          # CH2; or Robot(channels=(CH_CATH,))
 try:
     robot.clamp()
 
@@ -532,12 +614,12 @@ finally:
 Speed + `dt` instead of distance, on CH2 only — continuous, no stop between rows:
 
 ```python
-from control import run_from_log, run_from_cmds
-from robot_core import StepCmd
+from aviar import CH_GUIDE, Robot, StepCmd, replay
+import control
 
-run_from_log("data/device_logs.txt", assume_units="rad")   # single-instrument log
+control.main()                                             # runs its SETTINGS block
 
-run_from_cmds([
+replay(Robot(channels=(CH_GUIDE,)), [                      # or an explicit list
     StepCmd(v2_mm_s=+10, w2_deg_s=-90, v4_mm_s=0, dt=0.1),   # 1.0 mm, -9 deg
     StepCmd(v2_mm_s=+10, w2_deg_s=-30, v4_mm_s=0, dt=0.5),   # 5.0 mm, -15 deg
 ])
@@ -548,8 +630,9 @@ run_from_cmds([
 From the repository root:
 
 ```bash
-python3 control.py              # scripted demo sequence (CH2)
-python3 dual_control.py         # replay data/control_logs.txt on CH2 + CH4
+python3 control.py              # replay data/device_logs.txt on CH2
+python3 dual_control.py         # replay data/control_logs.txt on CH4 + CH2
+python3 manual_control.py       # run the hand-written move sequence on one channel
 python3 guidewire_panel.py      # render the replay to videos/ (no robot needed)
 
 python3 test/test_communication.py
@@ -617,12 +700,20 @@ executes. `dual_control.py` no longer decimates: it replays **every** data row, 
 
 Controllers:
 
-- `robot_core.py`: **shared core** — network settings, calibration, command encoding, `StepCmd`,
-  the log parser (`iter_stepcmds_from_log`, caller-named columns), and the UDP transport
-  (`RobotLink`). Imported by both controllers, so the encoders and parser exist in one place only.
-  Contains no column names of its own.
-- `control.py`: single-channel (CH2) — distance/angle API, CH2 log replay, demo motion sequence
-- `dual_control.py`: dual-channel (CH2 + CH4) log replay, time-shared with the full `dt` per channel
+The library (`aviar/`, see §7) — contains no log column names of its own:
+
+- `aviar/config.py`: every constant, plus `Params` for per-run overrides
+- `aviar/protocol.py`: command encoding and `StepCmd` — pure, no I/O
+- `aviar/link.py`: `RobotLink`, the only socket in the package
+- `aviar/robot.py`: the `Robot` controller
+- `aviar/logs.py`: `iter_stepcmds_from_log`, caller-named columns
+- `aviar/replay.py`: `replay()`, one clamped session
+
+Use cases (repository root, ~40 lines each):
+
+- `control.py`: replay a one-instrument log on CH2 — names its `device_*` columns
+- `dual_control.py`: replay a two-instrument log on CH4+CH2 — names its `guide_*`/`cath_*` columns
+- `manual_control.py`: drive one channel by hand in mm/deg — a channel and a list of moves
 - `guidewire_panel.py`: pygame 4-quadrant visualization + MP4 export of a replay. Standalone — it
   keeps its own parser copy and still decimates on `wall_time`, so it does not use `dt`.
 
