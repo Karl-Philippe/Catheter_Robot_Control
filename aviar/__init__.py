@@ -23,6 +23,12 @@ Modules:
     robot      Robot, the controller
     logs       reading recorded logs into StepCmds
     replay     running a StepCmd stream as one clamped session
+    retract    reversing a run to retrace it back to the start
+    live       LiveState + TappedLink, for watching a run as it happens
+    panel      pygame drawing primitives (needs pygame)
+
+`live` and `panel` are not imported here so the core stays dependency-free --
+import them directly (`from aviar.live import LiveState`).
 """
 
 from .config import (
@@ -45,6 +51,7 @@ from .link import RobotLink
 from .logs import iter_stepcmds_from_log
 from .protocol import StepCmd, encode_rotation_signed, encode_translation_signed
 from .replay import replay
+from .retract import net_travel, reverse
 from .robot import Robot
 
 __all__ = [
@@ -59,6 +66,9 @@ __all__ = [
     # logs + running
     "iter_stepcmds_from_log",
     "replay",
+    # retract
+    "reverse",
+    "net_travel",
     # channels
     "CH_GUIDE",
     "CH_CATH",

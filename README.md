@@ -13,18 +13,23 @@ aviar/              the library (see §7)
   robot.py          Robot, the controller
   logs.py           reading recorded logs
   replay.py         running a StepCmd stream
+  retract.py        reversing a run to retrace it back to the start
+  live.py           LiveState + TappedLink, for watching a run happen
+  livepanel.py      run_live(), the live screen
+  panel.py          pygame drawing primitives (shared by both panels)
 
 control.py          USE CASE: replay a 1-instrument log on CH2          (§5)
 dual_control.py     USE CASE: replay a 2-instrument log on CH4+CH2      (§5)
 manual_control.py   USE CASE: drive one channel by hand, in mm and deg  (§7.2)
+live_panel.py       shortcut for dual_control.py with the screen on   (§7.4)
 ```
 
-Each script is ~40 lines: it names its log columns or its list of moves, and calls the library.
-All the machinery lives in `aviar/`.
+Each script names its log columns or its list of moves and calls the library; all the machinery
+lives in `aviar/`.
 
 Supporting files:
 
-- Replay visualization / video export: `guidewire_panel.py`
+- Offline replay visualization / video export: `guidewire_panel.py`
 - Input logs for replay: `data/`
 - Communication + calibration scripts: `test/`
 - Calibration result tables: `test/data/`
@@ -446,7 +451,57 @@ the clamp.
 `INTERLEAVE` does **not** apply here: there is no second channel to alternate with, so it is a
 dual-channel concept only (§5.5). `robot.step(cmd)` executes a single `StepCmd` directly.
 
-### 7.4 Calibration moves
+### 7.4 Live panel — watching a run
+
+The panel is a **switch on the replay scripts**, not a separate one. Set `LIVE_PANEL = True` in
+the SETTINGS block of `control.py` or `dual_control.py` and run it as usual:
+
+```bash
+python3 control.py         # CH2, with the screen
+python3 dual_control.py    # CH4 + CH2, with the screen
+python3 live_panel.py      # shortcut: dual_control.py with LIVE_PANEL forced on
+```
+
+It replays whatever that script's settings say — same log, columns, interleave and retract — so
+there is one place to configure a run. Set `INITIAL_ANGLE_DEG` / `INITIAL_POS_MM` to wherever you
+set the instrument up by hand; the panel tracks from there.
+
+With `LIVE_PANEL = False` (the default) nothing changes and **pygame is never imported**, so the
+headless path keeps working on a machine without it.
+
+The same four quadrants as `guidewire_panel.py`, but driven by the commands actually being sent
+rather than by a file read in advance, plus a status strip: phase and progress, the integrated
+insertion/angle estimate, the raw UDP frames per channel with clamp state, and a rolling speed
+chart. Close the window or press ESC to stop — the run ends at the next row boundary and the robot
+is released and closed properly. When the run finishes the window stays up showing the final state
+until you close it.
+
+**Robot timing is not affected.** The robot runs in a worker thread and the panel on the main
+thread, sharing one lock-guarded `LiveState`. The tap costs ~0.24 µs per frame against the 10 ms
+send interval. Rendering is the part that could interfere — it holds the GIL — so the live panel
+renders at HD/30 fps rather than the exporter's FHD/60 and shortens `sys.setswitchinterval`.
+Measured: step timing lands within **0.6 ms** of running with no panel at all. Raising
+`AVIAR_RESOLUTION` or `FPS` trades that margin away.
+
+### 7.5 Retract — retracing a run backwards
+
+Set `RETRACT = True` in `control.py`, `dual_control.py` or `live_panel.py`. The run replays, pauses
+for `RETRACT_PAUSE_S`, then runs `aviar.retract.reverse(rows)`: the same rows last-to-first with
+every speed negated. Each row keeps its own `dt`, so the reverse covers exactly the same distance
+and angle and the instrument ends where it began (verified: 0.000 mm, 0.00 deg).
+
+```python
+from aviar import reverse, net_travel
+net_travel(rows + reverse(rows))     # ~(0.0, 0.0, 0.0)
+```
+
+**There is no speed multiplier, deliberately.** Retracting faster means scaling the speeds up, and
+rotation is already near the 360 deg/s protocol ceiling: on `data/control_logs.txt` a 2x factor
+pushes 22 of 70 rows past it, they silently under-rotate, and the "reverse" leaves ~10 deg of
+residual twist. Translation would survive (10 mm/s is far from its 50 mm/s limit) but rotation
+would not, so the reverse runs at the recorded speed.
+
+### 7.6 Calibration moves
 
 ### Translation
 
@@ -633,7 +688,8 @@ From the repository root:
 python3 control.py              # replay data/device_logs.txt on CH2
 python3 dual_control.py         # replay data/control_logs.txt on CH4 + CH2
 python3 manual_control.py       # run the hand-written move sequence on one channel
-python3 guidewire_panel.py      # render the replay to videos/ (no robot needed)
+python3 live_panel.py           # dual_control.py with the live screen on
+python3 guidewire_panel.py      # render an offline replay to videos/ (no robot needed)
 
 python3 test/test_communication.py
 python3 test/test_control.py
@@ -708,12 +764,17 @@ The library (`aviar/`, see §7) — contains no log column names of its own:
 - `aviar/robot.py`: the `Robot` controller
 - `aviar/logs.py`: `iter_stepcmds_from_log`, caller-named columns
 - `aviar/replay.py`: `replay()`, one clamped session
+- `aviar/retract.py`: `reverse()` — retrace a run back to its start
+- `aviar/live.py`: `LiveState` + `TappedLink` — watch a run without disturbing its timing
+- `aviar/livepanel.py`: `run_live()` — the window, the worker thread and the status strip
+- `aviar/panel.py`: pygame drawing primitives, shared by both panels
 
 Use cases (repository root, ~40 lines each):
 
 - `control.py`: replay a one-instrument log on CH2 — names its `device_*` columns
 - `dual_control.py`: replay a two-instrument log on CH4+CH2 — names its `guide_*`/`cath_*` columns
 - `manual_control.py`: drive one channel by hand in mm/deg — a channel and a list of moves
+- `live_panel.py`: shortcut for `dual_control.py` with `LIVE_PANEL` on
 - `guidewire_panel.py`: pygame 4-quadrant visualization + MP4 export of a replay. Standalone — it
   keeps its own parser copy and still decimates on `wall_time`, so it does not use `dt`.
 
