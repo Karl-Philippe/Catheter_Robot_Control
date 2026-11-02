@@ -804,3 +804,17 @@ Reference:
 
 This is research/prototyping code. It is open-loop. Use in a safe test setup, start with low speeds,
 and assume the robot can do surprising things when friction changes.
+
+It is **not a certified medical device** and is **not intended for clinical use** or for use on
+patients. It is provided "as is", without warranty of any kind (see the License).
+
+---
+
+## 14) License
+
+Copyright 2026 Karl-Philippe Beaudet
+
+Licensed under the [Apache License, Version 2.0](LICENSE). You may not use this code except in
+compliance with the License. Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS
+OF ANY KIND, either express or implied. See [`LICENSE`](LICENSE) for the full terms.

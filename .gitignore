@@ -1,0 +1,12 @@
+# Python environment
+.venv/
+venv/
+env/
+.env
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Exported videos
+videos/
